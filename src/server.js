@@ -2,9 +2,9 @@
 
 const express = require('express')
 const cors = require('cors')
-const Database = require('better-sqlite3')
 const fs = require('fs')
 const path = require('path')
+const { createStorage } = require('./storage')
 
 let fetchFn = typeof globalThis.fetch === 'function' ? globalThis.fetch : null
 if (!fetchFn) {
@@ -25,7 +25,7 @@ const CRYPTO_SYMBOLS = ['btcusdt', 'ethusdt', 'xrpusdt', 'ltcusdt', 'eosusdt', '
 
 const POLL_INTERVAL_MS = Number(process.env.KLINE_POLL_INTERVAL_MS || 1000)
 const DB_DIR = path.resolve(__dirname, '..', 'data')
-const DB_PATH = path.join(DB_DIR, 'kline.db')
+const DB_PATH = path.join(DB_DIR, 'kline.json')
 const parsedRetention = Number(process.env.KLINE_RETENTION_DAYS || 7)
 const RETENTION_DAYS = Number.isFinite(parsedRetention) && parsedRetention > 0 ? parsedRetention : 7
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000
@@ -35,82 +35,7 @@ if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true })
 }
 
-const db = new Database(DB_PATH)
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS kline_snapshots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT NOT NULL,
-    timestamp_ms INTEGER NOT NULL,
-    open REAL,
-    close REAL,
-    high REAL,
-    low REAL,
-    volume REAL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_kline_symbol_time ON kline_snapshots (symbol, timestamp_ms);
-
-  CREATE TABLE IF NOT EXISTS latest_quotes (
-    symbol TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    price REAL,
-    open REAL,
-    close REAL,
-    high REAL,
-    low REAL,
-    volume REAL,
-    amount REAL,
-    update_time INTEGER NOT NULL
-  );
-`)
-
-const insertSnapshotStmt = db.prepare(`
-  INSERT INTO kline_snapshots
-    (symbol, timestamp_ms, open, close, high, low, volume, created_at)
-  VALUES
-    (@symbol, @timestamp, @open, @close, @high, @low, @volume, @createdAt)
-`)
-
-const upsertQuoteStmt = db.prepare(`
-  INSERT INTO latest_quotes
-    (symbol, type, price, open, close, high, low, volume, amount, update_time)
-  VALUES
-    (@symbol, @type, @price, @open, @close, @high, @low, @volume, @amount, @updateTime)
-  ON CONFLICT(symbol) DO UPDATE SET
-    type = excluded.type,
-    price = excluded.price,
-    open = excluded.open,
-    close = excluded.close,
-    high = excluded.high,
-    low = excluded.low,
-    volume = excluded.volume,
-    amount = excluded.amount,
-    update_time = excluded.update_time
-`)
-
-const selectLatestQuotesStmt = db.prepare(`
-  SELECT symbol, type, price, open, close, high, low, volume, amount, update_time
-  FROM latest_quotes
-  ORDER BY symbol ASC
-`)
-
-const selectLatestQuoteStmt = db.prepare(`
-  SELECT symbol, type, price, open, close, high, low, volume, amount, update_time
-  FROM latest_quotes
-  WHERE symbol = ?
-`)
-
-const selectSnapshotsStmt = db.prepare(`
-  SELECT symbol, timestamp_ms AS timestamp, open, close, high, low, volume
-  FROM kline_snapshots
-  WHERE symbol = ? AND timestamp_ms >= ?
-  ORDER BY timestamp_ms ASC
-`)
-
-const deleteOlderThanStmt = db.prepare(`
-  DELETE FROM kline_snapshots WHERE timestamp_ms < ?
-`)
+const storage = createStorage(DB_PATH)
 
 const app = express()
 app.use(cors())
@@ -122,7 +47,7 @@ app.get('/health', function (_req, res) {
 
 app.get('/api/market/quotes', function (_req, res) {
   try {
-    const rows = selectLatestQuotesStmt.all()
+    const rows = storage.getAllQuotes()
     res.json(rows.map(mapQuoteRow))
   } catch (error) {
     console.error('Failed to query latest quotes:', error)
@@ -137,7 +62,7 @@ app.get('/api/market/quote', function (req, res) {
   }
 
   try {
-    const row = selectLatestQuoteStmt.get(symbol)
+    const row = storage.getQuote(symbol)
     if (!row) {
       return res.status(404).json({ error: 'quote not found' })
     }
@@ -165,7 +90,7 @@ app.get('/api/market/kline', function (req, res) {
   const minTimestamp = Date.now() - lookbackMs
 
   try {
-    const rows = selectSnapshotsStmt.all(symbol, minTimestamp)
+    const rows = storage.getSnapshots(symbol, minTimestamp)
     if (!rows.length) {
       return res.json({ symbol: symbol, interval: intervalMinutes + 'm', candles: [] })
     }
@@ -181,9 +106,9 @@ app.get('/api/market/kline', function (req, res) {
 setInterval(function () {
   const cutoff = Date.now() - RETENTION_MS
   try {
-    const info = deleteOlderThanStmt.run(cutoff)
-    if (info.changes > 0) {
-      console.log('[KLine] Cleaned ' + info.changes + ' rows older than ' + new Date(cutoff).toISOString())
+    const removed = storage.deleteSnapshotsBefore(cutoff)
+    if (removed > 0) {
+      console.log('[KLine] Cleaned ' + removed + ' rows older than ' + new Date(cutoff).toISOString())
     }
   } catch (error) {
     console.error('Failed to clean old snapshots:', error)
@@ -195,8 +120,6 @@ const jobConfigs = CRYPTO_SYMBOLS.map(function (symbol) {
 })
 
 let isPolling = false
-const lastSnapshotMap = new Map()
-
 function pollQuotes() {
   if (isPolling) return
   isPolling = true
@@ -244,6 +167,24 @@ const PORT = Number(process.env.KLINE_PORT || 4000)
 app.listen(PORT, function () {
   console.log('📈 KLine server running on http://localhost:' + PORT)
 })
+
+let isShuttingDown = false
+function handleShutdown(signal) {
+  if (isShuttingDown) {
+    return
+  }
+  isShuttingDown = true
+  console.log('Received ' + signal + ', flushing storage before shutdown...')
+  try {
+    storage.flushSync()
+  } catch (error) {
+    console.error('Failed to flush storage during shutdown:', error)
+  }
+  process.exit(0)
+}
+
+process.on('SIGINT', function () { handleShutdown('SIGINT') })
+process.on('SIGTERM', function () { handleShutdown('SIGTERM') })
 
 function fetchQuoteFromUpstream(_type, symbol) {
   return fetchCryptoQuote(symbol)
@@ -300,29 +241,26 @@ function storeQuote(raw) {
     updateTime: Math.trunc(toSafeNumber(raw.updateTime) || now)
   }
 
-  try {
-    upsertQuoteStmt.run(normalized)
-  } catch (error) {
-    console.error('Failed to upsert quote:', error)
+  const storedQuote = storage.upsertQuote(normalized)
+  if (!storedQuote) {
+    console.error('Failed to upsert quote for ' + normalized.symbol)
     return false
   }
 
-  const lastTs = lastSnapshotMap.get(normalized.symbol)
+  const lastTs = storage.getLastSnapshotTimestamp(normalized.symbol)
   if (normalized.updateTime !== lastTs) {
-    try {
-      insertSnapshotStmt.run({
-        symbol: normalized.symbol,
-        timestamp: normalized.updateTime,
-        open: normalized.open,
-        close: normalized.close,
-        high: normalized.high,
-        low: normalized.low,
-        volume: normalized.volume,
-        createdAt: now
-      })
-      lastSnapshotMap.set(normalized.symbol, normalized.updateTime)
-    } catch (error) {
-      console.error('Failed to insert snapshot:', error)
+    const inserted = storage.insertSnapshot({
+      symbol: normalized.symbol,
+      timestamp: normalized.updateTime,
+      open: normalized.open,
+      close: normalized.close,
+      high: normalized.high,
+      low: normalized.low,
+      volume: normalized.volume,
+      createdAt: now
+    })
+    if (!inserted) {
+      console.error('Failed to insert snapshot for ' + normalized.symbol)
     }
   }
 
@@ -340,7 +278,7 @@ function mapQuoteRow(row) {
     low: toSafeNumber(row.low),
     volume: toSafeNumber(row.volume),
     amount: toSafeNumber(row.amount),
-    updateTime: row.update_time
+    updateTime: row.updateTime
   }
 }
 
